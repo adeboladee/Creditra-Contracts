@@ -14,6 +14,71 @@ fn check(entrypoint: &str, sample: BudgetSample) {
     instrument::check_or_log_missing(entrypoint, sample, &baselines);
 }
 
+// ── 0. draw_credit scaling (N lines) ────────────────────────────────────────
+//
+// `adjust_total_utilized` rescans all lines, so draw/repay cost scales with
+// `CreditLineCount`. This test opens N lines and measures the CPU/memory cost
+// of a single `draw_credit`, asserting sub-linear growth across N=10,100,500.
+//
+// Ratio bound: cost(500) / cost(10) must be < 50 (i.e. sub-linear; a truly
+// linear scan would give ~50x, so we allow a small constant-factor margin and
+// require strictly less than the linear extrapolation).
+#[test]
+fn budget_draw_credit_scaling() {
+    fn measure_draw_at(n: u32) -> BudgetSample {
+        let (env, credit, token, _admin, _borrower) = setup_credit_harness();
+
+        // Open N-1 filler lines to grow CreditLineCount, then one target line.
+        for _ in 0..n.saturating_sub(1) {
+            let b = Address::generate(&env);
+            token.mint(&b, &1_000_000_i128);
+            credit.open_credit_line(&b, &1_000_000_i128, &500_u32, &100_u32);
+            credit.deposit_collateral(&b, &200_000_i128);
+        }
+
+        let target = Address::generate(&env);
+        token.mint(&target, &1_000_000_i128);
+        credit.open_credit_line(&target, &1_000_000_i128, &500_u32, &100_u32);
+        credit.deposit_collateral(&target, &200_000_i128);
+
+        BudgetSample::measure(&env, || {
+            credit.draw_credit(&target, &100_000_i128);
+        })
+    }
+
+    let sample_10 = measure_draw_at(10);
+    let sample_100 = measure_draw_at(100);
+    let sample_500 = measure_draw_at(500);
+
+    // Record the largest-N sample against the baseline entrypoint.
+    check(entrypoint::DRAW_CREDIT, sample_500);
+
+    let cpu_10 = sample_10.cpu as u128;
+    let cpu_100 = sample_100.cpu as u128;
+    let cpu_500 = sample_500.cpu as u128;
+
+    // Guard against degenerate zero-cost measurements.
+    assert!(cpu_10 > 0, "cpu_10 must be non-zero");
+    assert!(cpu_100 > 0, "cpu_100 must be non-zero");
+    assert!(cpu_500 > 0, "cpu_500 must be non-zero");
+
+    // Sub-linear bound: 500/10 = 50x linear; require strictly below that.
+    let ratio_500_over_10 = cpu_500 / cpu_10.max(1);
+    assert!(
+        ratio_500_over_10 < 50,
+        "draw_credit CPU cost grew linearly with line count: \
+         cpu_10={cpu_10}, cpu_500={cpu_500}, ratio={ratio_500_over_10} (bound < 50)"
+    );
+
+    // 100/10 = 10x linear; require strictly below that.
+    let ratio_100_over_10 = cpu_100 / cpu_10.max(1);
+    assert!(
+        ratio_100_over_10 < 10,
+        "draw_credit CPU cost grew linearly with line count: \
+         cpu_10={cpu_10}, cpu_100={cpu_100}, ratio={ratio_100_over_10} (bound < 10)"
+    );
+}
+
 // ── 1. init ──────────────────────────────────────────────────────────────────
 #[test]
 fn budget_init() {
@@ -114,7 +179,19 @@ fn budget_deposit_collateral() {
     check(entrypoint::DEPOSIT_COLLATERAL, sample);
 }
 
-// ── 10. withdraw_collateral ────────────────────────────────────────────────
+// ── 10. partial_release_collateral ─────────────────────────────────────────
+#[test]
+fn budget_partial_release_collateral() {
+    let (env, credit, _token, _admin, borrower) = setup_credit_harness();
+    credit.open_credit_line(&borrower, &1_000_000_i128, &500_u32, &100_u32);
+    credit.deposit_collateral(&borrower, &200_000_i128);
+    let sample = BudgetSample::measure(&env, || {
+        credit.partial_release_collateral(&borrower, &50_000_i128);
+    });
+    check(entrypoint::PARTIAL_RELEASE_COLLATERAL, sample);
+}
+
+// ── 11. withdraw_collateral ────────────────────────────────────────────────
 #[test]
 fn budget_withdraw_collateral() {
     let (env, credit, _token, _admin, borrower) = setup_credit_harness();
@@ -126,7 +203,7 @@ fn budget_withdraw_collateral() {
     check(entrypoint::WITHDRAW_COLLATERAL, sample);
 }
 
-// ── 11. accrue_batch ───────────────────────────────────────────────────────
+// ── 12. accrue_batch ───────────────────────────────────────────────────────
 #[test]
 fn budget_accrue_batch() {
     let (env, credit, token, _admin, _admin_addr) = setup_credit_harness();
@@ -147,43 +224,27 @@ fn budget_accrue_batch() {
     check(entrypoint::ACCRUE_BATCH, sample);
 }
 
-// ── 12. freeze_draws / unfreeze_draws ──────────────────────────────────────
+// ── 13. freeze_draws / unfreeze_draws ──────────────────────────────────────
 #[test]
 fn budget_freeze_draws() {
-    let baselines = load_baselines();
-    let (env, credit, _token, _admin, _borrower) = setup();
-    budget(&env).reset_unlimited();
-    credit.freeze_draws(&creditra_credit::FreezeReason::LiquidityReserve);
-    let cpu = budget(&env).cpu_instruction_cost();
-    let mem = budget(&env).memory_bytes_cost();
-    if let Some(b) = baselines.get("freeze_draws") {
-        assert_within_tolerance("freeze_draws", cpu, mem, b);
-    } else {
-        println!(
-            "[budget_regression] no baseline for 'freeze_draws'; observed cpu={cpu} mem={mem}"
-        );
-    }
+    let (env, credit, ..) = setup_credit_harness();
+    let sample = BudgetSample::measure(&env, || {
+        credit.freeze_draws(&creditra_credit::FreezeReason::LiquidityReserve);
+    });
+    check(entrypoint::FREEZE_DRAWS, sample);
 }
 
 #[test]
 fn budget_unfreeze_draws() {
-    let baselines = load_baselines();
-    let (env, credit, _token, _admin, _borrower) = setup();
+    let (env, credit, ..) = setup_credit_harness();
     credit.freeze_draws(&creditra_credit::FreezeReason::LiquidityReserve);
-    budget(&env).reset_unlimited();
-    credit.unfreeze_draws();
-    let cpu = budget(&env).cpu_instruction_cost();
-    let mem = budget(&env).memory_bytes_cost();
-    if let Some(b) = baselines.get("unfreeze_draws") {
-        assert_within_tolerance("unfreeze_draws", cpu, mem, b);
-    } else {
-        println!(
-            "[budget_regression] no baseline for 'unfreeze_draws'; observed cpu={cpu} mem={mem}"
-        );
-    }
+    let sample = BudgetSample::measure(&env, || {
+        credit.unfreeze_draws();
+    });
+    check(entrypoint::UNFREEZE_DRAWS, sample);
 }
 
-// ── 13. default_credit_line ───────────────────────────────────────────────
+// ── 14. default_credit_line ───────────────────────────────────────────────
 #[test]
 fn budget_default_credit_line() {
     let (env, credit, _token, _admin, borrower) = setup_credit_harness();
@@ -197,7 +258,7 @@ fn budget_default_credit_line() {
     check(entrypoint::DEFAULT_CREDIT_LINE, sample);
 }
 
-// ── 14. close_credit_line ─────────────────────────────────────────────────
+// ── 15. close_credit_line ─────────────────────────────────────────────────
 #[test]
 fn budget_close_credit_line() {
     let (env, credit, _token, admin, borrower) = setup_credit_harness();
@@ -206,4 +267,86 @@ fn budget_close_credit_line() {
         credit.close_credit_line(&borrower, &admin);
     });
     check(entrypoint::CLOSE_CREDIT_LINE, sample);
+}
+
+// ── 16. place_bid ─────────────────────────────────────────────────────────────
+#[test]
+fn budget_place_bid() {
+    let (env, auction, _token, admin, bidder1, _) = instrument::setup_auction_harness();
+    let auction_id = soroban_sdk::Symbol::new(&env, "auc_bid");
+    
+    auction.init_auction(
+        &auction_id,
+        &gateway_auction::AuctionMode::English,
+        &0_u64,
+        &u64::MAX,
+        &100_i128,
+        &0_u32,
+        &None,
+        &None,
+        &gateway_auction::DutchAuctionDecay::None,
+        &None,
+    );
+
+    let sample = BudgetSample::measure(&env, || {
+        auction.place_bid(&auction_id, &bidder1, &100_i128);
+    });
+    check(entrypoint::PLACE_BID, sample);
+}
+
+// ── 17. bid_refunded ──────────────────────────────────────────────────────────
+#[test]
+fn budget_bid_refunded() {
+    let (env, auction, _token, admin, bidder1, bidder2) = instrument::setup_auction_harness();
+    let auction_id = soroban_sdk::Symbol::new(&env, "auc_refund");
+    
+    auction.init_auction(
+        &auction_id,
+        &gateway_auction::AuctionMode::English,
+        &0_u64,
+        &u64::MAX,
+        &100_i128,
+        &0_u32,
+        &None,
+        &None,
+        &gateway_auction::DutchAuctionDecay::None,
+        &None,
+    );
+
+    auction.place_bid(&auction_id, &bidder1, &100_i128);
+
+    let sample = BudgetSample::measure(&env, || {
+        auction.place_bid(&auction_id, &bidder2, &200_i128);
+    });
+    check(entrypoint::BID_REFUNDED, sample);
+}
+
+// ── 18. settle_default_liquidation (auction) ──────────────────────────────────
+#[test]
+fn budget_settle_default_liquidation_auction() {
+    let (env, auction, _token, admin, bidder1, _) = instrument::setup_auction_harness();
+    let auction_id = soroban_sdk::Symbol::new(&env, "auc_settle");
+    
+    auction.init_auction(
+        &auction_id,
+        &gateway_auction::AuctionMode::English,
+        &0_u64,
+        &u64::MAX,
+        &100_i128,
+        &0_u32,
+        &None,
+        &None,
+        &gateway_auction::DutchAuctionDecay::None,
+        &None,
+    );
+
+    auction.place_bid(&auction_id, &bidder1, &100_i128);
+    auction.close_auction(&auction_id);
+    
+    let borrower = Address::generate(&env);
+
+    let sample = BudgetSample::measure(&env, || {
+        auction.settle_default_liquidation(&auction_id, &admin, &borrower);
+    });
+    check(entrypoint::SETTLE_DEFAULT_LIQUIDATION, sample);
 }

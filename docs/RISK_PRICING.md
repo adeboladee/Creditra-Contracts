@@ -22,6 +22,7 @@ Companion docs: `docs/risk-based-rate-formula.md` (terse normative reference),
 | Credit limit $\ell$ | `i128` | `[MinCreditLimit, MaxCreditLimit]` | Off-chain scorer / admin policy |
 | Rate config $(b, s, r_{\min}, r_{\max})$ | `RateFormulaConfig` | each `u32` in `[0, 10_000]`, `r_{\min} \leq r_{\max} \leq 10\,000` | `set_rate_formula_config` (`lib.rs:1159`) |
 | Per-borrower floor $r_{\text{floor}}$ | `Option<u32>` | `[0, 10_000]` | `set_borrower_rate_floor` (`lib.rs:578`) |
+| Per-borrower ceiling $r_{\text{ceiling}}$ | `Option<u32>` | `[0, 10_000]` and `floor <= ceiling` when both are set | `set_borrower_rate_ceiling` (`lib.rs:775`) |
 | Rate-change config $(\Delta r_{\max}, \tau_{\min})$ | `RateChangeConfig` | `bps, seconds` | `set_rate_change_limits` (`lib.rs:569`) |
 | Penalty surcharge $\rho$ | `u32` | `[0, 10_000]` | `set_penalty_surcharge_bps` (`lib.rs:587`) |
 | Grace period $(T_g, m, r_g)$ | `GracePeriodConfig` | $T_g$ in seconds, mode FullWaiver/ReducedRate, $r_g$ in bps | `set_grace_period_config` (`lib.rs:646`) |
@@ -30,7 +31,7 @@ Companion docs: `docs/risk-based-rate-formula.md` (terse normative reference),
 | Last accrual timestamp $t_{\text{last}}$ | `u64` | unix seconds | updated only when $\Delta I > 0$ |
 
 The on-chain function is therefore deterministic in
-$(k, \ell, b, s, r_{\min}, r_{\max}, r_{\text{floor}}, \rho, T_g, m, r_g, u, I, t_{\text{last}}, t_{\text{now}})$
+$(k, \ell, b, s, r_{\min}, r_{\max}, r_{\text{floor}}, r_{\text{ceiling}}, \rho, T_g, m, r_g, u, I, t_{\text{last}}, t_{\text{now}})$
 — there is no hidden state.
 
 ---
@@ -69,19 +70,27 @@ pub fn compute_rate_from_score(cfg: &RateFormulaConfig, k: u32) -> u32 {
 }
 ```
 
-### 2.2 Per-borrower floor
+### 2.2 Per-borrower floor and ceiling
 
 After the formula computes $r(k)$, an optional per-borrower floor
-$r_{\text{floor}}$ is applied:
+$r_{\text{floor}}$ and ceiling $r_{\text{ceiling}}$ are applied:
 
 $$
-r_{\text{eff}}(k, \text{borrower}) = \max\big(r(k), \; r_{\text{floor}}(\text{borrower}) \big)
+r_{\text{eff}}(k, \text{borrower}) = \min\Big(\max\big(r(k), \; r_{\text{floor}}(\text{borrower}) \big), \; r_{\text{ceiling}}(\text{borrower})\Big)
 $$
 
 The floor is stored under `DataKey::RateFloorBps(Address)` (Persistent,
 `contracts/credit/src/storage.rs:357`). Use cases: a borrower in a higher-risk
 jurisdiction, or one with a sticky penalty history, can be assigned a hard
 minimum rate that overrides a favorable formula.
+
+The ceiling is stored under `DataKey::RateCeilingBps(Address)` (Persistent).
+It caps that borrower's manual or formula-derived rate before rate-change
+guardrails run. The admin setters reject inconsistent bounds in either
+direction: a ceiling below an existing floor, or a floor above an existing
+ceiling, reverts with `ContractError::RateTooHigh`.
+
+When either bound is unset, that side of the clamp is skipped.
 
 ### 2.3 Rate-change cap
 
@@ -123,6 +132,10 @@ For $k \in \{0, 25, 50, 75, 100\}$:
 
 A borrower with $r_{\text{floor}} = 1000$ at $k=0$ would see $r_{\text{eff}}
 = \max(200, 1000) = 1000$ (10.00 %).
+
+A borrower with $r_{\text{ceiling}} = 4000$ at $k=100$ would see
+$r_{\text{eff}} = \min(5000, 4000) = 4000$ (40.00 %), even though the formula
+would otherwise clamp at 50.00 %.
 
 This example is the canonical test fixture in `tests/risk_formula_tests.rs`.
 
@@ -190,11 +203,113 @@ Example with `RateFormulaConfig(200, 50, 200, 5 000)`:
 | Floor + ceiling sandwich | 50 | 2 700 | 3 000 | 4 000 | 3 000 bps (30.00 %) |
 | Ceiling below floor (rejected) | 50 | 2 700 | 3 000 | 2 500 | Rejected at config-set time (`RateTooHigh`) |
 
-The stacking order means the ceiling **always wins** if it is set below the
-floor. The contract rejects `ceiling < floor` at configuration time
-(`risk.rs:169-174`), so a misconfigured admin cannot create an unresolvable
-ordering. Tested in `tests/borrower_rate_floor.rs` and
+The contract rejects inconsistent borrower-specific bounds in either
+direction: `ceiling < floor` when setting a ceiling and `floor > ceiling`
+when setting a floor. That prevents a misconfigured admin from creating an
+unresolvable ordering. Tested in `tests/borrower_rate_floor.rs` and
 `tests/borrower_rate_ceiling.rs`.
+
+### 2.8 Per-borrower risk admin cooldown (Issue #1280)
+
+#### Motivation
+
+The earlier single global `LastRiskAdminActionTs` caused `update_risk_parameters`
+for **any** borrower to start a shared cooldown window. After updating borrower A,
+the admin had to wait the full cooldown before updating borrower B. Re-scoring an
+entire portfolio after a market event therefore became **serial and slow**, creating
+pressure to disable the cooldown entirely and eliminating its security value.
+
+#### Scope change
+
+As of this fix, the cooldown is **per-borrower**. Each borrower's last-action
+timestamp is tracked independently in persistent storage under the composite key
+`(symbol_short!("rad_last"), borrower)` — the same pattern used by
+`LastAccrualAdminActionTs`.
+
+The global `rad_last` instance key is retained for backward compatibility but is
+no longer written to or enforced by `update_risk_parameters`.
+
+#### Storage keys
+
+| Key | Storage tier | Type | Description |
+|---|---|---|---|
+| `symbol_short!("rad_cool")` | Instance | `u64` | Cooldown duration in seconds (global, 0 = disabled) |
+| `(symbol_short!("rad_last"), borrower)` | Persistent | `u64` | Last risk admin action timestamp for the specific borrower |
+
+#### Enforcement logic (`storage.rs: assert_risk_admin_cooldown_elapsed_for`)
+
+```
+fn assert_risk_admin_cooldown_elapsed_for(env, borrower):
+    cooldown = get_risk_admin_cooldown_seconds(env)
+    if cooldown == 0: return          // disabled
+    last_ts = get_last_risk_admin_action_ts_for(env, borrower)
+    if last_ts == 0: return           // first update always allowed
+    now = env.ledger().timestamp()
+    if now < last_ts + cooldown:
+        revert RiskAdminCooldownActive = 54
+```
+
+- When `cooldown_seconds == 0` (default): enforcement is disabled entirely —
+  backward compatible, no change in behavior.
+- When no prior action exists for the borrower (`last_ts == 0`): the first
+  `update_risk_parameters` always succeeds, regardless of cooldown duration.
+  This allows a full portfolio rescore with a fresh deployment without
+  serialization.
+- Otherwise: the call reverts with `ContractError::RiskAdminCooldownActive = 54`
+  if the elapsed time since the last update for **that specific borrower** is less
+  than the configured cooldown.
+
+#### Key properties
+
+1. **Updating borrower A does not block borrower B.** Each borrower has its own
+   independent cooldown window. After updating A at $t_0$, the admin can
+   immediately update B (provided B has no prior action, or its own window has
+   elapsed).
+
+2. **Repeated update of A within cooldown still reverts.** The per-borrower
+   timestamp is written after every successful `update_risk_parameters` call, so
+   A's second call within the window is still blocked.
+
+3. **Portfolio rescoring is parallel, not serial.** When each borrower has no
+   prior action recorded (first-time scoring or fresh deployment), all borrowers
+   can be updated in a single pass regardless of the cooldown setting.
+
+#### Worked numerical example — per-borrower isolation
+
+Configure `cooldown_seconds = 3 600` (1 hour).
+
+| Event | Timestamp | Borrower | Result | Reason |
+|---|---|---|---|---|
+| Open line A and B | t=0 | A, B | — | Credit lines created |
+| Update A | t=1 000 | A | **Allowed** | No prior action for A |
+| Update B | t=1 001 | B | **Allowed** | No prior action for B (A's cooldown is irrelevant) |
+| Update A again | t=1 001 | A | **Blocked** | 1 s < 3 600 s → `RiskAdminCooldownActive` |
+| Update A again | t=4 600 | A | **Allowed** | 3 600 s elapsed since t=1 000 |
+| Update B again | t=4 601 | B | **Blocked** | Only 3 600 s elapsed since t=1 001 → 1 s short |
+| Update B again | t=4 601 | B | **Allowed** (at t=4 601) | 3 600 s elapsed since t=1 001 |
+
+#### creditra-risk contract note
+
+The standalone `creditra-risk` contract (under `contracts/risk/`) operates
+without a borrower key — it holds a single global parameter set rather than
+per-borrower state. Its `risk_admin_cooldown` tests (`contracts/risk/tests/risk_admin_cooldown.rs`)
+therefore still use a single shared timestamp, which is semantically correct for
+that contract's model. The per-borrower scoping described here applies only to the
+`creditra-credit` contract.
+
+#### Test coverage
+
+| Test name | What it verifies |
+|---|---|
+| `cooldown_is_per_borrower_not_global` | Updating A does not block B |
+| `cooldown_blocks_same_borrower_within_window` | Repeated update of A still reverts |
+| `cooldown_independent_windows_per_borrower` | A and B have independent expiry times |
+| `portfolio_rescore_not_serialized` | All borrowers can be first-updated in one pass |
+| `cooldown_elapses_correctly` | Window expires at exactly `last_ts + cooldown_seconds` |
+| `first_risk_update_always_succeeds_even_with_cooldown` | First update never blocked |
+
+Full test file: `contracts/credit/tests/risk_admin_cooldown.rs`
+Validation command: `cargo test -p creditra-credit --test risk_admin_cooldown`
 
 ---
 
@@ -826,7 +941,7 @@ Key differences:
 | `compute_rate_from_score` clamp | `contracts/credit/src/risk_formula_tests.rs` (inline tests) |
 | Saturating arithmetic on rate | `risk_formula_tests.rs` |
 | Per-borrower rate floor override | `contracts/credit/tests/borrower_rate_floor.rs` |
-| Per-borrower rate ceiling interaction | `tests/borrower_rate_ceiling.rs` |
+| Per-borrower rate ceiling interaction | `contracts/credit/tests/borrower_rate_ceiling.rs` |
 | Rate-change cap (magnitude) | `tests/state_transition_invariants.rs`, worked example §2.5 |
 | Rate-change cap (cadence) | `tests/monotonic_timestamps.rs`, worked example §2.6 |
 | Floor-rounded accrual | `tests/accrual_overflow_audit.rs`, inline `accrual_tests.rs` |

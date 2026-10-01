@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use creditra_credit::{Credit, CreditClient};
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{token, Address, Env};
 
 fn setup() -> (Env, Address, Address, Address, Address, Address) {
@@ -26,16 +26,16 @@ fn setup() -> (Env, Address, Address, Address, Address, Address) {
     (env, contract_id, token_address, borrower, reserve, treasury)
 }
 
-fn prepare_repay(
-    env: &Env,
-    contract_id: &Address,
-    token_address: &Address,
-    borrower: &Address,
+fn prepare_repay<'a>(
+    env: &'a Env,
+    contract_id: &'a Address,
+    token_address: &'a Address,
+    borrower: &'a Address,
     draw_amount: i128,
     repay_amount: i128,
     interest_rate_bps: u32,
     fee_bps: u32,
-) -> CreditClient {
+) -> CreditClient<'a> {
     let client = CreditClient::new(env, contract_id);
     client.open_credit_line(borrower, &draw_amount, &interest_rate_bps, &50_u32);
 
@@ -91,8 +91,8 @@ fn protocol_fee_zero_fee_keeps_treasury_balance_at_zero() {
 }
 
 #[test]
-fn protocol_fee_max_fee_accrues_expected_fee_amount() {
-    let (env, contract_id, token_address, borrower, reserve, treasury) = setup();
+fn protocol_fee_on_total_repayment_accrues_expected_fee_amount() {
+    let (env, contract_id, token_address, borrower, reserve, _treasury) = setup();
     let client = prepare_repay(
         &env,
         &contract_id,
@@ -110,41 +110,150 @@ fn protocol_fee_max_fee_accrues_expected_fee_amount() {
 
     client.repay_credit(&borrower, &1_100);
 
+    // fee = 10% of 1100 = 110; reserve = 1100 - 110 = 990
     assert_eq!(
         token_client.balance(&contract_id),
-        contract_balance_before + 10
+        contract_balance_before + 110
     );
-    assert_eq!(
-        token_client.balance(&reserve),
-        reserve_balance_before + 1_090
-    );
-    assert_eq!(token_client.balance(&treasury), 0);
+    assert_eq!(token_client.balance(&reserve), reserve_balance_before + 990);
 }
 
 #[test]
-fn protocol_fee_rounding_edge_floors_small_fee_to_zero() {
-    let (env, contract_id, token_address, borrower, reserve, treasury) = setup();
+fn protocol_fee_rounding_floors_sub_bps_fee_to_zero() {
+    let (env, contract_id, token_address, borrower, reserve, _treasury) = setup();
     let client = prepare_repay(
         &env,
         &contract_id,
         &token_address,
         &borrower,
         10_000,
-        10_001,
-        1,
         5_000,
+        1,
+        1,
     );
 
     let token_client = token::Client::new(&env, &token_address);
     let contract_balance_before = token_client.balance(&contract_id);
     let reserve_balance_before = token_client.balance(&reserve);
 
-    client.repay_credit(&borrower, &10_001);
+    client.repay_credit(&borrower, &5_000);
 
+    // fee = apply_bps(5000, 1, Floor) = 0 — sub-bps rounding
     assert_eq!(token_client.balance(&contract_id), contract_balance_before);
     assert_eq!(
         token_client.balance(&reserve),
-        reserve_balance_before + 10_001
+        reserve_balance_before + 5_000
     );
-    assert_eq!(token_client.balance(&treasury), 0);
+}
+
+fn setup_for_withdraw() -> (Env, Address, Address, Address, Address, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let reserve = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract_id = env.register(Credit, ());
+    let client = CreditClient::new(&env, &contract_id);
+    client.init(&admin);
+
+    let token_id = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token_address = token_id.address();
+
+    client.set_liquidity_token(&token_address);
+    client.set_liquidity_source(&reserve);
+    client.set_treasury(&admin, &treasury);
+
+    (env, contract_id, token_address, borrower, reserve, treasury, admin)
+}
+
+#[test]
+fn withdraw_treasury_success_moves_exactly_accrued_balance() {
+    let (env, contract_id, token_address, borrower, _reserve, treasury, admin) = setup_for_withdraw();
+    let client = prepare_repay(
+        &env,
+        &contract_id,
+        &token_address,
+        &borrower,
+        1_000,
+        1_100,
+        1_000,
+        1_000,
+    );
+    let token_client = token::Client::new(&env, &token_address);
+    
+    client.repay_credit(&borrower, &1_100);
+    let accrued = client.get_protocol_summary().treasury_balance;
+    assert_eq!(accrued, 110);
+
+    let contract_balance_before = token_client.balance(&contract_id);
+    let treasury_balance_before = token_client.balance(&treasury);
+
+    client.withdraw_treasury(&admin);
+
+    assert_eq!(client.get_protocol_summary().treasury_balance, 0);
+    assert_eq!(token_client.balance(&contract_id), contract_balance_before - accrued);
+    assert_eq!(token_client.balance(&treasury), treasury_balance_before + accrued);
+}
+
+#[test]
+fn withdraw_treasury_zero_balance_returns_without_transfer() {
+    let (env, contract_id, token_address, _borrower, _reserve, treasury, admin) = setup_for_withdraw();
+    let client = CreditClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_address);
+    
+    assert_eq!(client.get_protocol_summary().treasury_balance, 0);
+    let contract_balance_before = token_client.balance(&contract_id);
+    let treasury_balance_before = token_client.balance(&treasury);
+
+    client.withdraw_treasury(&admin);
+
+    assert_eq!(client.get_protocol_summary().treasury_balance, 0);
+    assert_eq!(token_client.balance(&contract_id), contract_balance_before);
+    assert_eq!(token_client.balance(&treasury), treasury_balance_before);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #30)")]
+fn withdraw_treasury_missing_treasury_reverts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(Credit, ());
+    let client = CreditClient::new(&env, &contract_id);
+    client.init(&admin);
+    client.withdraw_treasury(&admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")]
+fn withdraw_treasury_missing_token_reverts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let contract_id = env.register(Credit, ());
+    let client = CreditClient::new(&env, &contract_id);
+    client.init(&admin);
+    client.set_treasury(&admin, &treasury);
+    
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&soroban_sdk::Symbol::new(&env, "TreasuryBalance"), &100_i128);
+    });
+
+    client.withdraw_treasury(&admin);
+}
+
+#[test]
+#[should_panic]
+fn withdraw_treasury_non_admin_reverts() {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(Credit, ());
+    let client = CreditClient::new(&env, &contract_id);
+    client.init(&admin);
+    
+    let non_admin = Address::generate(&env);
+    client.withdraw_treasury(&non_admin);
 }
